@@ -2,6 +2,8 @@
 
 from enum import EnumMeta
 
+from decimal import Decimal
+
 
 class InvalidColumnDefinition(Exception):
     pass
@@ -18,7 +20,7 @@ class Column(object):
         You can't have both a primary_key and composite_key in the same model.
         index is whether you want this column indexed or not for faster retrieval.
         """
-        if type not in (str, int):
+        if type not in (str, int, Decimal):
             # TODO: support for other field types (datetime, uuid, etc)
             err_msg = 'Bad Field Type: {}'.format(type)
             raise InvalidColumnDefinition(err_msg)
@@ -70,3 +72,24 @@ class Integer(Column):
 
     async def auto_generate(self, db, model):
         return await db.incr('auto:{}:{}'.format(model.key_prefix(), self.name))
+
+
+class DecimalColumn(Column):
+    
+    def __init__(self, decimal_places=10, *kwargs):
+        kwargs.pop('type', None)
+        kwargs['type'] = Decimal
+        self.decimal_places = decimal_places
+        super(DecimalColumn, self).__init__(**kwargs)
+        
+    def get_redis_value(self, decimal_value):
+        '''Turns Python native value into Redis Value'''
+        if not isinstance(decimal_value, Decimal):
+            # we have to do this in case a user passes in a float for filtering, etc...
+            decimal_value = Decimal(str(decimal_value))
+        return str(int(decimal_value * (10**self.decimal_places)))
+    
+    def get_python_value(self, redis_value):
+        ''' Turns Redis native Value into python value'''
+        
+        return Decimal(str(redis_value)) / (10**self.decimal_places)

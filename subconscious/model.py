@@ -38,6 +38,7 @@ class ModelMeta(type):
         super(ModelMeta, cls).__init__(what, bases, attributes)
         if cls.__name__ not in ('RedisModel', 'TimeStampedModel'):
             columns = []
+            
             num_primary, num_composite = 0, 0
             cls._pk_name = None
             # grab all Columns from the model
@@ -49,6 +50,7 @@ class ModelMeta(type):
                     cls._pk_name = column.name
                 if column.composite:
                     num_composite += 1
+             
 
             # Defensive checks
             if num_primary == 0:
@@ -62,6 +64,7 @@ class ModelMeta(type):
                 if num_composite != 0:
                     err_msg = 'Cannot have both primary and composite keys in {}'.format(cls.__name__)
                     raise InvalidModelDefinition(err_msg)
+                
 
             cls._columns = tuple(sorted(columns, key=lambda c: c.name))
             cls._indexed_columns = tuple(sorted([col for col in cls._columns if col.indexed], key=lambda c: c.name))
@@ -81,6 +84,9 @@ class ModelMeta(type):
             cls._indexed_column_names = {col.name for col in cls._indexed_columns}
             cls._columns_map = {c.name: c for c in cls._columns}
             cls._identifier_column_names = tuple([x.name for x in cls._identifier_columns])
+            
+            # we have to transform values in these columns on save / index creation / load / query
+            cls._transform_columns = {col.name: col for col in cls._columns if hasattr(col, 'get_redis_value') }
 
 
 class RedisModel(object, metaclass=ModelMeta):
@@ -185,14 +191,22 @@ class RedisModel(object, metaclass=ModelMeta):
         for indexed_column in self._queryable_colnames_set:
             index_key = self.get_index_key(indexed_column)
             if stale_object:
+                stale_value = getattr(stale_object, indexed_column)
+                if indexed_column.name in self._transform_columns:
+                    stale_value = indexed_column.get_redis_value(stale_value)
                 stale_index_value = '{}{}{}'.format(
-                    getattr(stale_object, indexed_column),
+                    stale_value,
                     VALUE_ID_SEPARATOR,
                     stale_object.identifier()
                 )
                 await db.zrem(index_key, stale_index_value)
+            value = getattr(self, indexed_column)
+            
+            if indexed_column.name in self._transform_columns:
+                value = indexed_column.get_redis_value(value)
+            
             index_value = '{}{}{}'.format(
-                getattr(self, indexed_column),
+                value,
                 VALUE_ID_SEPARATOR,
                 self.identifier()
             )
@@ -206,11 +220,17 @@ class RedisModel(object, metaclass=ModelMeta):
         for col in self._auto_columns:
             if not self.has_real_data(col.name):
                 kwargs[col.name] = await col.auto_generate(db, self)
+            
         self.__dict__.update(kwargs)
-
+        
+        
+        data = self.__dict__.copy()
+        for name, col in self._transform_columns.items():
+            data[col.name] = col.get_redis_value(data[col.name])
+        
         # we have to delete the old index key
         stale_object = await self.__class__.load(db, identifier=self.identifier())
-        success = await db.hmset_dict(self.redis_key(), self.__dict__.copy())
+        success = await db.hmset_dict(self.redis_key(), data)
         await self.save_index(db, stale_object=stale_object)
         return success
 
@@ -234,6 +254,8 @@ class RedisModel(object, metaclass=ModelMeta):
                 column = getattr(cls, key, False)
                 if not column or (column.field_type == str):
                     kwargs[key] = value
+                elif key in cls._transform_columns:
+                    kwargs[key] = column.get_python_value(value)
                 else:
                     kwargs[key] = column.field_type(value)
             kwargs['loading'] = True
@@ -306,6 +328,10 @@ class RedisModel(object, metaclass=ModelMeta):
                 values = [str(x) for x in v]
             else:
                 values = (str(v),)
+                
+            if k in cls._transform_columns:
+                values = [cls._transform_columns[k].get_redis_value(value) for value in values]
+                
             temp_set = set()
             for value in values:
                 temp_set = temp_set.union({x.partition(VALUE_ID_SEPARATOR)[2] for x in await db.zrangebylex(
